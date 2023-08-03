@@ -917,6 +917,8 @@ class MBartDecoder(MBartPreTrainedModel):
             combined_attention_mask = (
                 expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
             )
+            combined_attention_mask[:, :, 1:, 1:11] = 0. # After eos predicts lid, priming the decoder to always see the image embeddings
+            # combined_attention_mask[:, :, 1:10] = torch.finfo(inputs_embeds.dtype).min # After eos predicts lid, setting no-ops while "decoding" image embeddings
 
         return combined_attention_mask
 
@@ -1068,6 +1070,7 @@ class MBartDecoder(MBartPreTrainedModel):
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
+
                 if use_cache:
                     logger.warning(
                         "`use_cache=True` is incompatible with gradient checkpointing`. Setting `use_cache=False`..."
@@ -1092,6 +1095,7 @@ class MBartDecoder(MBartPreTrainedModel):
                     None,
                 )
             else:
+
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -1195,6 +1199,7 @@ class MBartModel(MBartPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        clip_embs: Optional[bool] = None,
     ) -> Union[Seq2SeqModelOutput, Tuple[torch.FloatTensor]]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1227,10 +1232,13 @@ class MBartModel(MBartPreTrainedModel):
             )
 
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
+        encoder_last_hidden_state = encoder_outputs.last_hidden_state
+        if hasattr(self, 'get_gated_outputs'):
+            encoder_last_hidden_state = self.get_gated_outputs(encoder_last_hidden_state, attention_mask, clip_embs)
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
-            encoder_hidden_states=encoder_outputs[0],
+            encoder_hidden_states=encoder_last_hidden_state,
             encoder_attention_mask=attention_mask,
             head_mask=decoder_head_mask,
             cross_attn_head_mask=cross_attn_head_mask,
@@ -1326,6 +1334,7 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        clip_embs: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Seq2SeqLMOutput, Tuple[torch.FloatTensor]]:
         r"""
@@ -1362,6 +1371,7 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            clip_embs=clip_embs,
         )
         lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
 
@@ -1396,17 +1406,27 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
         cross_attn_head_mask=None,
         use_cache=None,
         encoder_outputs=None,
-        **kwargs,
+        **kwargs
     ):
+        # cut decoder_input_ids if decoder_inputs_embeds is used
+        decoder_inputs_embeds = kwargs.get('decoder_inputs_embeds')
+        decoder_attention_mask = kwargs.get('decoder_attention_mask')
+        if decoder_inputs_embeds is not None:
+            decoder_input_ids = None
         # cut decoder_input_ids if past is used
-        if past_key_values is not None:
-            decoder_input_ids = decoder_input_ids[:, -1:]
+        if past_key_values is not None: # Never used in my scenario
+            if decoder_inputs_embeds is not None:
+                decoder_inputs_embeds = decoder_inputs_embeds[:, -1:, :]
+            else:
+                decoder_input_ids = decoder_input_ids[:, -1:]
 
         return {
             "input_ids": None,  # encoder_outputs is defined. input_ids not needed
             "encoder_outputs": encoder_outputs,
             "past_key_values": past_key_values,
             "decoder_input_ids": decoder_input_ids,
+            "decoder_inputs_embeds": decoder_inputs_embeds,
+            "decoder_attention_mask": decoder_attention_mask,
             "attention_mask": attention_mask,
             "head_mask": head_mask,
             "decoder_head_mask": decoder_head_mask,
